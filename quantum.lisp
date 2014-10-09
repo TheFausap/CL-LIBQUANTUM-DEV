@@ -46,8 +46,7 @@
 
 (defun quantum-n2char (mu buf)
 "Convert a big integer to a byte array"
-(let ((size 0))
-  (setq size +MAX_UNSIGNED+)
+(let ((size +MAX-UNSIGNED+))
   (loop for i from 0 below size do
         (setf (aref buf i) (/ mu (ash 1 (* 8 (1- (- size i))))))
         (setq mu (rem mu (ash 1 (* 8 (1- (- size i)))))))))
@@ -57,6 +56,7 @@
   (setq allocated 1)
   (setq objcode (make-array +OBJCODE-PAGE+
                             :element-type integer
+                            :adjustable 't
                             :initial-element #xFF)))
 
 (defun quantum-objcode-stop ()
@@ -64,11 +64,13 @@
   (setq allocated 0)
   (setq objcode (make-array 1
                             :element-type integer
+                            :adjustable 't
                             :initial-element #xFF)))
 
 (defun quantum-objcode-put (operation &rest vals)
 "Store an operation with its arguments in the object code data"
 (let ((i 0)
+      (size +MAX-UNSIGNED+)
       (buf (make-array 80 :element-type 'integer :initial-element #xFF))
       (d 0.0)
       (mu 0.0))
@@ -88,14 +90,34 @@
                 +HADAMARD+ +BMEASURE+
                 +BMEASURE-P+ +SWAPLEADS+) (quantum-n2char (car vals) (aref buf 1)))
     ((+ROT-X+ +ROT-Y+
-              +ROT-Z+ +PHASE_KICK+
-              +PHASE_SCALE+) (progn
+              +ROT-Z+ +PHASE-KICK+
+              +PHASE-SCALE+) (progn
                                (quantum-n2char (car vals) (aref buf 1))
                                (quantum-n2char (cadr vals) (aref buf 2))))
     (+CPHASE-KICK+ (progn
                      (quantum-n2char (car vals) (aref buf 1))
-                     (quantum-n2char (cadr vals)
-)))
+                     (quantum-n2char (cadr vals) (aref buf 2))
+                     (quantum-n2char (caddr vals) (aref buf 3))))
+    ((+MEASURE+ +NOP+))
+    (t (format t "INVALID QUANTUM OPCODE~%")))
+  (if (> (/ (+ position size) +OBJCODE-PAGE+) (/ position +OBJCODE-PAGE+))
+      (progn
+        (incf allocated)
+        (setf objcode (adjust-array objcode (* allocated +OBJCODE-PAGE+)))))
+  (loop for i from 0 below size do
+        (progn
+          (setf (aref objcode position) (aref buf i))
+          (incf position)))
+  (return-from quantum-objcode-put 1) 
+))
+
+(defun quantum-objcode-write (file)
+"Save the recorded object code data to a file"
+(with-open-file (stream-1 file :direction :output
+                          :if-exists :supersede
+                          :if-does-not-exist :create)
+  (loop for i from 0 below (array-dimension objcode 0) do
+        (format stream-1 "~a~%" (aref objcode i)))))
 
 (defun bit-vector->integer (bit-vector)
 "Create a positive integer from a bit-vector."
@@ -591,15 +613,11 @@ out))
   (if (/= (quantum-reg-hashw reg) 0)
       (progn
         (quantum-reconstruct-hash reg)
-;        (break)
         (loop for i from 0 below (quantum-reg-size reg) do
-;              (break)
               (if (= (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target)) reg) -1)
                   (setf addsize (1+ addsize))))
-;        (break)
         (setf (quantum-reg-state reg) (adjust-array (quantum-reg-state reg) (+ (quantum-reg-size reg) addsize)))
         (setf (quantum-reg-amplitude reg) (adjust-array (quantum-reg-amplitude reg) (+ (quantum-reg-size reg) addsize)))
-;        (break)
         (loop for i from 0 below addsize do
               (setf (aref (quantum-reg-state reg) (+ i (quantum-reg-size reg))) 0)
               (setf (aref (quantum-reg-amplitude reg) (+ i (quantum-reg-size reg))) #c(0.0 0.0)))))
