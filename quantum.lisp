@@ -75,7 +75,7 @@
       (d 0.0)
       (mu 0.0))
   (if (= opstatus 0)
-      (return-from quantum-objcode-put 0))
+      (return-from quantum-objcode-put nil)) ; perform the gate operations
   (setf (aref buf 0) operation)
   (case operation
     (+INIT+ (quantum-n2char (car vals) (aref buf 1)))
@@ -108,7 +108,7 @@
         (progn
           (setf (aref objcode position) (aref buf i))
           (incf position)))
-  (return-from quantum-objcode-put 1) 
+  (return-from quantum-objcode-put t) ; do not perform gate operation, stores only!
 ))
 
 (defun quantum-objcode-write (file)
@@ -774,6 +774,8 @@ out))
 (defun quantum-hadamard (target reg)
 "Apply a hadamard gate"
 (let ((m (quantum-new-matrix 2 2)))
+  (if (quantum-objcode-put +HADAMARD+ target)
+      (return-from quantum-hadamard))
   (setf (aref (quantum-matrix-t1 m) 0) (sqrt (/ 1.0 2.0)))
   (setf (aref (quantum-matrix-t1 m) 1) (sqrt (/ 1.0 2.0)))
   (setf (aref (quantum-matrix-t1 m) 2) (sqrt (/ 1.0 2.0)))
@@ -784,6 +786,17 @@ out))
 "Apply a walsh-hadamard transform"
 (loop for i from 0 below width do
       (quantum-hadamard i reg)))
+
+(defun quantum-r-x (target gamma reg)
+"Apply a rotation about the x-axis by the angle GAMMA"
+(let ((m (quantum-new-matrix 2 2)))
+  (if (quantum-objcode-put +ROT-X+ target gamma)
+      (return-from quantum-r-x))
+  (setf (aref (quantum-matrix-t1 m) 0) (complex (cos (/ gamma 2)) 0.0))
+  (setf (aref (quantum-matrix-t1 m) 1) (complex 0.0 -(sin (/ gamma 2))))
+  (setf (aref (quantum-matrix-t1 m) 2) (complex 0.0 -(sin (/ gamma 2))))
+  (setf (aref (quantum-matrix-t1 m) 3) (complex (cos (/ gamma 2)) 0.0))
+  (quantum-gate1 target m reg)))
 
 
 
