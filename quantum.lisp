@@ -2,6 +2,10 @@
 ;;; F. Saporito
 ;;; 25 sept 2014
 
+(require :lparallel)
+(defpackage :lib-quantum (:use :cl :lparallel))
+(in-package :lib-quantum)
+
 (defconstant *epsilon* 0.000001)
 (defconstant *pi* (* 4.0 (atan 1)))
 (defconstant *num-regs* 4)
@@ -32,6 +36,11 @@
 (defconstant +NOP+ #xFF)
 ;;;
 (defparameter opstatus 0)
+;;; Type of QEC. Currently implemented versions are:
+;;; 0 : no QEC (default)
+;;; 1 : Steane's 3-bit code
+(defparameter qec-type 0)
+(defparameter qec-width 0) ; How many qubits are protected
 (defparameter objcode (make-array 255 
                                :element-type 'integer
                                :adjustable 't
@@ -43,6 +52,17 @@
                                   :adjustable 't
                                   :initial-element #xFF))
 ;;; end of objcode 
+
+;;; QEC section 
+
+(defun quantum-qec-set-status (stype swidth)
+"Change the status of the QEC."
+  (setq qec-type stype)
+  (setq qec-width swidth)
+)
+
+
+;;; end of QEC section
 
 (defun quantum-n2char (mu buf)
 "Convert a big integer to a byte array"
@@ -118,6 +138,10 @@
                           :if-does-not-exist :create)
   (loop for i from 0 below (array-dimension objcode 0) do
         (format stream-1 "~a~%" (aref objcode i)))))
+
+(defun quantum-decohere (reg)
+  reg
+)
 
 (defun bit-vector->integer (bit-vector)
 "Create a positive integer from a bit-vector."
@@ -211,7 +235,6 @@
         )
   (setq a num)
   (setq b den)
-  '()
   )
 )
 
@@ -686,9 +709,8 @@ out))
   (if (> (quantum-reg-size reg) (ash 1 (1- (quantum-reg-hashw reg))))
       (format t "Warning: inefficient hash table (size ~D vs hash ~D)~%"
               (quantum-reg-size reg) (ash 1 (quantum-reg-hashw reg))))
-; NO DECOHERENCE SET
-; (quantum-decohere reg)
-  reg))
+  (quantum-decohere reg)
+))
 
 (defun quantum-gate2 (target1 target2 m reg)
 "Apply 4x4 matrix M to the bits TARGET1 TARGET2. M should be unitary. Warning: code mostly untested."
@@ -768,7 +790,7 @@ out))
         (decf (quantum-reg-size reg) decsize)
         (setf (quantum-reg-amplitude reg) (adjust-array (quantum-reg-amplitude reg) (quantum-reg-size reg)))
         (setf (quantum-reg-state reg) (adjust-array (quantum-reg-state reg) (quantum-reg-size reg)))))
-; (quantum-decohere reg)
+  (quantum-decohere reg)
 ))
 
 (defun quantum-hadamard (target reg)
@@ -793,10 +815,95 @@ out))
   (if (quantum-objcode-put +ROT-X+ target gamma)
       (return-from quantum-r-x))
   (setf (aref (quantum-matrix-t1 m) 0) (complex (cos (/ gamma 2)) 0.0))
-  (setf (aref (quantum-matrix-t1 m) 1) (complex 0.0 -(sin (/ gamma 2))))
-  (setf (aref (quantum-matrix-t1 m) 2) (complex 0.0 -(sin (/ gamma 2))))
+  (setf (aref (quantum-matrix-t1 m) 1) (complex 0.0 (- (sin (/ gamma 2)))))
+  (setf (aref (quantum-matrix-t1 m) 2) (complex 0.0 (- (sin (/ gamma 2)))))
   (setf (aref (quantum-matrix-t1 m) 3) (complex (cos (/ gamma 2)) 0.0))
   (quantum-gate1 target m reg)))
 
+(defun quantum-r-y (target gamma reg)
+"Apply a rotation about the y-axis by the angle GAMMA"
+(let ((m (quantum-new-matrix 2 2)))
+  (if (quantum-objcode-put +ROT-Y+ target gamma)
+      (return-from quantum-r-y))
+  (setf (aref (quantum-matrix-t1 m) 0) (complex (cos (/ gamma 2)) 0.0))
+  (setf (aref (quantum-matrix-t1 m) 1) (complex (- (sin (/ gamma 2))) 0.0))
+  (setf (aref (quantum-matrix-t1 m) 2) (complex (sin (/ gamma 2)) 0.0))
+  (setf (aref (quantum-matrix-t1 m) 3) (complex (cos (/ gamma 2)) 0.0))
+  (quantum-gate1 target m reg)))
+
+(defun quantum-r-z (target gamma reg)
+"Apply a rotation about the z-axis by the angle GAMMA"
+(let ((z #c(0.0 0.0)))
+  (if (quantum-objcode-put +ROT-Z+ target gamma)
+      (return-from quantum-r-z))
+  (setq z (quantum-cexp (/ gamma 2)))
+  (loop for i from 0 below (quantum-reg-size reg) do
+        (progn
+          (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
+              (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) z))
+            (setf (aref (quantum-reg-amplitude reg) i) (/ (aref (quantum-reg-amplitude reg) i) z)))))
+  (quantum-decohere reg)
+))
+
+(defun quantum-phase-scale (target gamma reg)
+"Scale the phase of qubit"
+(let ((z #c(0.0 0.0)))
+  (if (quantum-objcode-put +PHASE-SCALE+ target gamma)
+      (return-from quantum-phase-scale))
+  (setq z (quantum-cexp gamma))
+  (loop for i from 0 below (quantum-reg-size reg) do
+        (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) z)))
+  (quantum-decohere reg)
+))
+
+(defun quantum-phase-kick (target gamma reg)
+"Apply a phase kick by the angle GAMMA"
+(let ((z #c(0.0 0.0)))
+  (if (quantum-objcode-put +PHASE-KICK+ target gamma)
+      (return-from quantum-phase-kick))
+  (setq z (quantum-cexp gamma))
+  (loop for i from 0 below (quantum-reg-size reg) do
+        (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
+            (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) z))))
+  (quantum-decohere reg)
+))
+
+(defun quantum-cond-phase (control target reg)
+"Apply a conditional phase shift by PI / 2^(CONTROL - TARGET)"
+(let ((z #c(0.0 0.0)))
+  (if (quantum-objcode-put +COND-PHASE+ control target)
+      (return-from quantum-cond-phase))
+  (setq z (quantum-cexp (/ *pi* (ash 1 (- control target)))))
+  (loop for i from 0 below (quantum-reg-size reg) do
+        (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control)) 0)
+            (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
+                (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) z)))))
+  (quantum-decohere reg)
+))
+
+(defun quantum-cond-phase-inv (control target reg)
+(let ((z #c(0.0 0.0)))
+  (setq z (quantum-cexp (/ (- *pi*) (ash 1 (- control target)))))
+  (loop for i from 0 below (quantum-reg-size reg) do
+        (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control)) 0)
+            (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
+                (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) z)))))
+  (quantum-decohere reg)
+))
+
+(defun quantum-cond-phase-kick (control target gamma reg)
+"Apply a conditional phase shift by PI / 2^(CONTROL - TARGET)"
+(let ((z #c(0.0 0.0)))
+  (if (quantum-objcode-put +CPHASE-KICK+ control target)
+      (return-from quantum-cond-phase-kick))
+  (setq z (quantum-cexp gamma))
+  (loop for i from 0 below (quantum-reg-size reg) do
+        (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control)) 0)
+            (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
+                (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) z)))))
+  (quantum-decohere reg)
+))
+
+  
 
 
