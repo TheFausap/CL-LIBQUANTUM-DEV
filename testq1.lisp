@@ -1,5 +1,4 @@
 ;;; test file
-(load "quantum")
 (setq m1 (quantum-new-matrix 2 2))
 (setq m2 (quantum-new-matrix 2 2))
 (setf (M m1 0 0) #c(2.0 3.0))
@@ -18,5 +17,4 @@
 (setq r2 (quantum-new-qureg 1 1))
 (quantum-print-qureg r1)
 (quantum-print-qureg r2)
-(step (quantum-hadamard 0 r1))
-
+(quantum-hadamard 0 r1)

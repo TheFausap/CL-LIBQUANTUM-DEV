@@ -2,13 +2,34 @@
 ;;; F. Saporito
 ;;; 25 sept 2014
 
-(require :lparallel)
-(defpackage :lib-quantum (:use :cl :lparallel))
-(in-package :lib-quantum)
+"(defpackage :lib-quantum (:use :cl)
+  (:export :quantum-qec-set-status
+           :quantum-n2char
+           :quantum-objcode-start
+           :quantum-objcode-stop
+           :quantum-objcode-put
+           :quantum-objcode-write
+           :quantum-decohere
+           :quantum-new-matrix
+           :quantum-print-matrix
+           :quantum-new-qureg
+           :quantum-print-qureg
+           :quantum-print-expn
+           :quantum-hadamard
+           :quantum-gate1
+           :quantum-gate2
+           :quantum-walsh
+           :quantum-r-x
+           :quantum-r-y
+           :quantum-r-z
+           :quantum-phase-scale
+           :quantum-phase-kick
+           :quantum-cond-phase
+           :quantum-normalize))
+(in-package :lib-quantum)"
 
-(defconstant *epsilon* 0.000001)
-(defconstant *pi* (* 4.0 (atan 1)))
-(defconstant *num-regs* 4)
+(defconstant +epsilon+ 0.000001)
+(defconstant +num-regs+ 4)
 (defconstant +MAX-UNSIGNED+ 64)
 (defconstant +OBJCODE-PAGE+ 65536)
 (defconstant +OBJBUF-SIZE+ 80)
@@ -41,6 +62,13 @@
 ;;; 1 : Steane's 3-bit code
 (defparameter qec-type 0)
 (defparameter qec-width 0) ; How many qubits are protected
+;;; Status of the decoherence simulation. Non-zero means enabled and
+;;; decoherence effects will be simulated.
+(defparameter decoherence-quantum-status 0)
+;;; Decoherence parameter. The higher the value, the greater the
+;;; decoherence impact.
+(defparameter decoherence-quantum-lambda 0.0)
+
 (defparameter objcode (make-array 255 
                                :element-type 'integer
                                :adjustable 't
@@ -51,6 +79,8 @@
                                   :element-type 'integer
                                   :adjustable 't
                                   :initial-element #xFF))
+
+(defparameter global-gate-counter 0)
 ;;; end of objcode 
 
 ;;; QEC section 
@@ -61,9 +91,51 @@
   (setq qec-width swidth)
 )
 
-
 ;;; end of QEC section
 
+;;; Decoherence
+(defun quantum-get-decoherence ()
+  decoherence-quantum-status)
+
+(defun quantum-set-decoherence (l)
+  (if (/= l 0)
+      (progn
+        (setq decoherence-quantum-status 1)
+        (setq decoherence-quantum-lambda l))
+      (setq decoherence-quantum-status 0)))
+
+(defun quantum-decohere (reg)
+  "Perform the actual decoherence of a quantum register for a single step of time. This is done by applying a phase shift by a normal
+  distributed angle with the variance LAMBDA."
+  (let ((v 0) (s 0)
+        (u 0) (x 0)
+        (nrands (make-array 1 :element-type 'integer :adjustable 't))
+        (angle 0))
+    (quantum-gate-counter 1)
+    (if (/= decoherence-quantum-status 0)
+        (progn
+          (setq nrands (adjust-array nrands (quantum-reg-width reg)))
+          (loop for i from 0 below (quantum-reg-width reg) do
+            (loop do (progn
+                       (setq u (1- (* 2.0 (random 1.0))))
+                       (setq v (1- (* 2.0 (random 1.0))))
+                       (setq s (+ (expt u 2) (expt v 2))))
+              while (>= s 1.0))
+            (setq x (* u (sqrt (* (- 2) (/ (log s) s)))))
+            (setq x (* x (sqrt (* 2.0 decoherence-quantum-lambda))))
+            (setf (aref nrands i) (/ x 2.0)))
+          (loop for i from 0 below (quantum-reg-size reg) do
+            (setq angle 0)
+            (loop for j from 0 below (quantum-reg-width reg) do
+              (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 j)) 0)
+                  (incf angle (aref nrands j))
+                  (decf angle (aref nrands j))))
+            (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) (quantum-cexp angle))))
+        )
+        )
+    )
+  )
+;;; end of decoherence
 (defun quantum-n2char (mu buf)
 "Convert a big integer to a byte array"
 (let ((size +MAX-UNSIGNED+))
@@ -75,7 +147,7 @@
   (setq opstatus 1)
   (setq allocated 1)
   (setq objcode (make-array +OBJCODE-PAGE+
-                            :element-type integer
+                            :element-type 'integer
                             :adjustable 't
                             :initial-element #xFF)))
 
@@ -83,102 +155,97 @@
   (setq opstatus 0)
   (setq allocated 0)
   (setq objcode (make-array 1
-                            :element-type integer
+                            :element-type 'integer
                             :adjustable 't
                             :initial-element #xFF)))
 
 (defun quantum-objcode-put (operation &rest vals)
-"Store an operation with its arguments in the object code data"
-(let ((i 0)
-      (size +MAX-UNSIGNED+)
-      (buf (make-array 80 :element-type 'integer :initial-element #xFF))
-      (d 0.0)
-      (mu 0.0))
-  (if (= opstatus 0)
-      (return-from quantum-objcode-put nil)) ; perform the gate operations
-  (setf (aref buf 0) operation)
-  (case operation
-    (+INIT+ (quantum-n2char (car vals) (aref buf 1)))
-    ((+CNOT+ +COND-PHASE+) (progn
-                       (quantum-n2char (car vals) (aref buf 1))
-                       (quantum-n2char (cadr vals) (aref buf 2))))
-    (+TOFFOLI+ (progn
-                 (quantum-n2char (car vals) (aref buf 1))
-                 (quantum-n2char (cadr vals) (aref buf 2))
-                 (quantum-n2char (caddr vals) (aref buf 3))))
-    ((+SIGMA-X+ +SIGMA-Y+ +SIGMA-Z+
-                +HADAMARD+ +BMEASURE+
-                +BMEASURE-P+ +SWAPLEADS+) (quantum-n2char (car vals) (aref buf 1)))
-    ((+ROT-X+ +ROT-Y+
-              +ROT-Z+ +PHASE-KICK+
-              +PHASE-SCALE+) (progn
+  "Store an operation with its arguments in the object code data"
+  (let (
+        (size +MAX-UNSIGNED+)
+        (buf (make-array 80 :element-type 'integer :initial-element #xFF))
+        )
+    (if (= opstatus 0)
+        (return-from quantum-objcode-put)) ; perform the gate operations
+    (setf (aref buf 0) operation)
+    (case operation
+      (+INIT+ (quantum-n2char (car vals) (aref buf 1)))
+      ((+CNOT+ +COND-PHASE+) (progn
                                (quantum-n2char (car vals) (aref buf 1))
                                (quantum-n2char (cadr vals) (aref buf 2))))
-    (+CPHASE-KICK+ (progn
-                     (quantum-n2char (car vals) (aref buf 1))
-                     (quantum-n2char (cadr vals) (aref buf 2))
-                     (quantum-n2char (caddr vals) (aref buf 3))))
-    ((+MEASURE+ +NOP+))
-    (t (format t "INVALID QUANTUM OPCODE~%")))
-  (if (> (/ (+ position size) +OBJCODE-PAGE+) (/ position +OBJCODE-PAGE+))
-      (progn
-        (incf allocated)
-        (setf objcode (adjust-array objcode (* allocated +OBJCODE-PAGE+)))))
-  (loop for i from 0 below size do
+      (+TOFFOLI+ (progn
+                   (quantum-n2char (car vals) (aref buf 1))
+                   (quantum-n2char (cadr vals) (aref buf 2))
+                   (quantum-n2char (caddr vals) (aref buf 3))))
+      ((+SIGMA-X+ +SIGMA-Y+ +SIGMA-Z+
+                  +HADAMARD+ +BMEASURE+
+                  +BMEASURE-P+ +SWAPLEADS+) (quantum-n2char (car vals) (aref buf 1)))
+      ((+ROT-X+ +ROT-Y+
+                +ROT-Z+ +PHASE-KICK+
+                +PHASE-SCALE+) (progn
+                                 (quantum-n2char (car vals) (aref buf 1))
+                                 (quantum-n2char (cadr vals) (aref buf 2))))
+      (+CPHASE-KICK+ (progn
+                       (quantum-n2char (car vals) (aref buf 1))
+                       (quantum-n2char (cadr vals) (aref buf 2))
+                       (quantum-n2char (caddr vals) (aref buf 3))))
+      ((+MEASURE+ +NOP+))
+      (otherwise (format t "INVALID QUANTUM OPCODE~%")))
+    (if (> (/ (+ posit size) +OBJCODE-PAGE+) (/ posit +OBJCODE-PAGE+))
         (progn
-          (setf (aref objcode position) (aref buf i))
-          (incf position)))
-  (return-from quantum-objcode-put t) ; do not perform gate operation, stores only!
-))
+          (incf allocated)
+          (setf objcode (adjust-array objcode (* allocated +OBJCODE-PAGE+)))))
+    (loop for i from 0 below size do
+      (progn
+        (setf (aref objcode posit) (aref buf i))
+        (incf posit)))
+    (return-from quantum-objcode-put t) ; do not perform gate operation, stores only!
+    ))
 
 (defun quantum-objcode-write (file)
-"Save the recorded object code data to a file"
-(with-open-file (stream-1 file :direction :output
-                          :if-exists :supersede
-                          :if-does-not-exist :create)
-  (loop for i from 0 below (array-dimension objcode 0) do
-        (format stream-1 "~a~%" (aref objcode i)))))
-
-(defun quantum-decohere (reg)
-  reg
-)
+  "Save the recorded object code data to a file"
+  (with-open-file (stream-1 file :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+    (loop for i from 0 below (array-dimension objcode 0) do
+      (format stream-1 "~a~%" (aref objcode i)))))
 
 (defun bit-vector->integer (bit-vector)
-"Create a positive integer from a bit-vector."
-(reduce #'(lambda (first-bit second-bit)
-            (+ (* first-bit 2) second-bit))
-        bit-vector))
+  "Create a positive integer from a bit-vector."
+  (reduce #'(lambda (first-bit second-bit)
+             (+ (* first-bit 2) second-bit))
+          bit-vector))
 
 (defun integer->bit-vector (integer)
-"Create a bit-vector from a positive integer."
-(labels ((integer->bit-list (int &optional accum)
-           (cond ((> int 0)
-                  (multiple-value-bind (i r) (truncate int 2)
-                    (integer->bit-list i (push r accum))))
-                 ((null accum) (push 0 accum))
-                 (t accum))))
-  (coerce (integer->bit-list integer) 'bit-vector)))
-    
+  "Create a bit-vector from a positive integer."
+  (labels ((integer->bit-list (int &optional accum)
+                              (cond ((> int 0)
+                                     (multiple-value-bind (i r) (truncate int 2)
+                                       (integer->bit-list i (push r accum))))
+                                    ((null accum) (push 0 accum))
+                                    (t accum))))
+    (coerce (integer->bit-list integer) 'bit-vector)))
+
 (defun ul-mult (a b)
-"Perform an unsigned-long multiplication (32-bit)."
-(let ((b64 #*)
-      (l-b64 0)
-      (j 31)
-      (cc 0)
-      (b32 (integer->bit-vector #xFFFFFFFF))
-      (k64 0))
-  (setq k64 (* a b))
-  (setq b64 (integer->bit-vector k64))
-  (setq l-b64 (1- (length b64)))
-  (if (> l-b64 31)
-      (progn
-        (setq cc (- l-b64 31))
-        (loop for i downfrom l-b64 to cc do
-              (setf (bit b32 j) (bit b64 i))
-              (decf j)))
-    (setq b32 b64))
-  (bit-vector->integer b32)
-))
+  "Perform an unsigned-long multiplication (32-bit)."
+  (let ((b64 #*)
+        (l-b64 0)
+        (j 31)
+        (cc 0)
+        (b32 (integer->bit-vector #xFFFFFFFF))
+        (k64 0))
+    (setq k64 (* a b))
+    (setq b64 (integer->bit-vector k64))
+    (setq l-b64 (1- (length b64)))
+    (if (> l-b64 31)
+        (progn
+          (setq cc (- l-b64 31))
+          (loop for i downfrom l-b64 to cc do
+            (setf (bit b32 j) (bit b64 i))
+            (decf j)))
+        (setq b32 b64))
+    (bit-vector->integer b32)
+    ))
 
 (defstruct quantum-reg
   (width 0 :type integer)
@@ -206,37 +273,37 @@
   `(aref (quantum-matrix-t1 ,m) (+ ,x (* ,y (quantum-matrix-cols ,m)))))
 
 (defun quantum-frac-approx (a b width)
-"Fractional approximation of a decimal value"
-(let (  (f (coerce (/ a b) 'float))
-        (g (coerce (/ a b) 'float))
-        (t1 0.0)
-        (num2 0)
-        (i 0)
-        (den2 1)
-        (num1 1)
-        (den1 0)
-        (num 1)
-        (den 1) )
-  (loop do
-        (progn
-          (setq i (floor (+ g 0.000005)))
-          (setq t1 (- i 0.000005))
-          (setq g (- g t1))
-          (setq g (/ 1.0 g))
-          (if (> (+ (* i den1) den2) (ash 1 width)) (return))
-          (setq num (+ (* i num1) num2))
-          (setq den (+ (* i den1) den2))
-          (setq num2 num1)
-          (setq den2 den1)
-          (setq num1 num)
-          (setq den1 den)
-          ) 
-        while (> (abs (- (coerce (/ num den) 'float) f)) (/ 1.0 (* 2 (ash 1 width))))
-        )
-  (setq a num)
-  (setq b den)
+  "Fractional approximation of a decimal value"
+  (let (  (f (coerce (/ a b) 'float))
+          (g (coerce (/ a b) 'float))
+          (t1 0.0)
+          (num2 0)
+          (i 0)
+          (den2 1)
+          (num1 1)
+          (den1 0)
+          (num 1)
+          (den 1) )
+    (loop do
+      (progn
+        (setq i (floor (+ g 0.000005)))
+        (setq t1 (- i 0.000005))
+        (setq g (- g t1))
+        (setq g (/ 1.0 g))
+        (if (> (+ (* i den1) den2) (ash 1 width)) (return))
+        (setq num (+ (* i num1) num2))
+        (setq den (+ (* i den1) den2))
+        (setq num2 num1)
+        (setq den2 den1)
+        (setq num1 num)
+        (setq den1 den)
+        ) 
+      while (> (abs (- (coerce (/ num den) 'float) f)) (/ 1.0 (* 2 (ash 1 width))))
+      )
+    (setq a num)
+    (setq b den)
+    )
   )
-)
 
 (defun quantum-getwidth (n)
 "Calculates the number of qubits required to store N"
@@ -508,10 +575,9 @@ Allocate memory for 1 base state"
        (out (make-quantum-reg))
        (pos2 (ash 1 pos)))
   (loop for i from 0 below (quantum-reg-size reg) do
-        (if (or (and (logand (aref (quantum-reg-state reg) i) pos2)
-                     value)
+        (if (or (and (logand (aref (quantum-reg-state reg) i) pos2) (if (= value 0) 'nil 't))
                 (and (lognand (aref (quantum-reg-state reg) i) pos2)
-                     (lognot value)))
+                     (if (= value 0) 't 'nil)))
             (progn
               (setq d (+ d (quantum-prob-inline (aref (quantum-reg-amplitude reg) i))))
               (setq l-siz (1+ l-siz)))))
@@ -528,13 +594,13 @@ Allocate memory for 1 base state"
   (setq j 0)
   (loop for i from 0 below (quantum-reg-size reg) do
         (if (or (and (logand (aref (quantum-reg-state reg) i) pos2)
-                     value)
+                     (if (= value 0) 'nil 't))
                 (and (lognand (aref (quantum-reg-state reg) i) pos2)
-                     (lognot value)))
+                     (if (= value 0) 't 'nil)))
             (progn
               (setq rpat (loop for k from 0 below pos sum (+ rpat (ash 1 k))))
               (setq rpat (logand rpat (aref (quantum-reg-state reg) i)))
-              (setq lpat (loop for k from (1- (* 8 *MAX-UNSIGNED*)) below pos by -1 sum (+ lpat (ash 1 k))))
+              (setq lpat (loop for k downfrom (1- (* 8 +MAX-UNSIGNED+)) to (1- pos) sum (+ lpat (ash 1 k))))
               (setq lpat (logand lpat (aref (quantum-reg-state reg) i)))
               (setf (aref (quantum-reg-state out) j) (logior (ash lpat -1) rpat))
               (setf (aref (quantum-reg-amplitude out) j) (* (aref (quantum-reg-amplitude reg) i)
@@ -603,7 +669,7 @@ out))
       (setq f (loop for i from 0 below (quantum-reg-size reg1) sum (* (aref (quantum-reg-amplitude reg1) i)
                                                                       (aref (quantum-reg-amplitude reg2) (aref (quantum-reg-state reg1) i)))))
     (loop for i from 0 below (quantum-reg-size reg1) do
-          (setq j (quantum-get-state (aref (quantum-reg-state reg1) i reg2)))
+          (setq j (quantum-get-state (aref (quantum-reg-state reg1) i) reg2))
           (if (> j -1)
               (setq f (* (aref (quantum-reg-amplitude reg1) i) (aref (quantum-reg-amplitude reg2) j))))))
   f))
@@ -648,7 +714,7 @@ out))
                          :element-type 'integer
                          :initial-element 0))
   (setq k (quantum-reg-size reg))
-  (setq limit (* *epsilon* (/ 1.0 (ash 1 (quantum-reg-width reg)))))
+  (setq limit (* +epsilon+ (/ 1.0 (ash 1 (quantum-reg-width reg)))))
   (loop for i from 0 below (quantum-reg-size reg) do
         (if (= (aref done i) 0)
             (progn
@@ -733,9 +799,9 @@ out))
         (quantum-add-hash (aref (quantum-reg-state reg) i) i reg))
 
   (loop for i from 0 below (quantum-reg-size reg) do
-        (if (= (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target1)) reg) -1)
+        (if (= (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target1)) reg) (- 1))
             (incf addsize))
-        (if (= (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target2)) reg) -1)
+        (if (= (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target2)) reg) (- 1))
             (incf addsize)))
   (setf (quantum-reg-state reg) (adjust-array (quantum-reg-state reg) (+ (quantum-reg-size reg) addsize)))
   (setf (quantum-reg-amplitude reg) (adjust-array (quantum-reg-amplitude reg) (+ (quantum-reg-size reg) addsize)))
@@ -754,9 +820,9 @@ out))
             (progn
               (setq j (quantum-bitmask (aref (quantum-reg-state reg) i) 2 bits))
               (setf (aref base j) i)
-              (setf (aref base (logxor j 1)) (quantum-get-state (logxor (aref (quantum-get-state reg) i) (ash 1 target2)) reg))
-              (setf (aref base (logxor j 2)) (quantum-get-state (logxor (aref (quantum-get-state reg) i) (ash 1 target1)) reg))
-              (setf (aref base (logxor j 3)) (quantum-get-state (logxor (logxor (aref (quantum-get-state reg) i)
+              (setf (aref base (logxor j 1)) (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target2)) reg))
+              (setf (aref base (logxor j 2)) (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target1)) reg))
+              (setf (aref base (logxor j 3)) (quantum-get-state (logxor (logxor (aref (quantum-reg-state reg) i)
                                                                                 (ash 1 target1))
                                                                         (ash 1 target2)) reg))
 
@@ -793,32 +859,41 @@ out))
   (quantum-decohere reg)
 ))
 
+(defun quantum-gate-counter (inc)
+  "Increase the gate counter by INC steps or reset it if INC < 0. The current value is returned"
+  (if (>= inc 0)
+      (incf global-gate-counter inc)
+      (setq global-gate-counter 0))
+  global-gate-counter)
+
 (defun quantum-hadamard (target reg)
-"Apply a hadamard gate"
-(let ((m (quantum-new-matrix 2 2)))
-  (if (quantum-objcode-put +HADAMARD+ target)
-      (return-from quantum-hadamard))
-  (setf (aref (quantum-matrix-t1 m) 0) (sqrt (/ 1.0 2.0)))
-  (setf (aref (quantum-matrix-t1 m) 1) (sqrt (/ 1.0 2.0)))
-  (setf (aref (quantum-matrix-t1 m) 2) (sqrt (/ 1.0 2.0)))
-  (setf (aref (quantum-matrix-t1 m) 3) (- (sqrt (/ 1.0 2.0))))
-  (quantum-gate1 target m reg)))
+  "Apply a hadamard gate"
+  (let ((m (quantum-new-matrix 2 2)))
+    (if (quantum-objcode-put +HADAMARD+ target)
+        (return-from quantum-hadamard))
+    (setf (aref (quantum-matrix-t1 m) 0) (sqrt (/ 1.0 2.0)))
+    (setf (aref (quantum-matrix-t1 m) 1) (sqrt (/ 1.0 2.0)))
+    (setf (aref (quantum-matrix-t1 m) 2) (sqrt (/ 1.0 2.0)))
+    (setf (aref (quantum-matrix-t1 m) 3) (- (sqrt (/ 1.0 2.0))))
+    (quantum-gate1 target m reg)
+    )
+  )
 
 (defun quantum-walsh (width reg)
-"Apply a walsh-hadamard transform"
-(loop for i from 0 below width do
-      (quantum-hadamard i reg)))
+  "Apply a walsh-hadamard transform"
+  (loop for i from 0 below width do
+    (quantum-hadamard i reg)))
 
 (defun quantum-r-x (target gamma reg)
-"Apply a rotation about the x-axis by the angle GAMMA"
-(let ((m (quantum-new-matrix 2 2)))
-  (if (quantum-objcode-put +ROT-X+ target gamma)
-      (return-from quantum-r-x))
-  (setf (aref (quantum-matrix-t1 m) 0) (complex (cos (/ gamma 2)) 0.0))
-  (setf (aref (quantum-matrix-t1 m) 1) (complex 0.0 (- (sin (/ gamma 2)))))
-  (setf (aref (quantum-matrix-t1 m) 2) (complex 0.0 (- (sin (/ gamma 2)))))
-  (setf (aref (quantum-matrix-t1 m) 3) (complex (cos (/ gamma 2)) 0.0))
-  (quantum-gate1 target m reg)))
+  "Apply a rotation about the x-axis by the angle GAMMA"
+  (let ((m (quantum-new-matrix 2 2)))
+    (if (quantum-objcode-put +ROT-X+ target gamma)
+        (return-from quantum-r-x))
+    (setf (aref (quantum-matrix-t1 m) 0) (complex (cos (/ gamma 2)) 0.0))
+    (setf (aref (quantum-matrix-t1 m) 1) (complex 0.0 (- (sin (/ gamma 2)))))
+    (setf (aref (quantum-matrix-t1 m) 2) (complex 0.0 (- (sin (/ gamma 2)))))
+    (setf (aref (quantum-matrix-t1 m) 3) (complex (cos (/ gamma 2)) 0.0))
+    (quantum-gate1 target m reg)))
 
 (defun quantum-r-y (target gamma reg)
 "Apply a rotation about the y-axis by the angle GAMMA"
@@ -873,7 +948,7 @@ out))
 (let ((z #c(0.0 0.0)))
   (if (quantum-objcode-put +COND-PHASE+ control target)
       (return-from quantum-cond-phase))
-  (setq z (quantum-cexp (/ *pi* (ash 1 (- control target)))))
+  (setq z (quantum-cexp (/ pi (ash 1 (- control target)))))
   (loop for i from 0 below (quantum-reg-size reg) do
         (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control)) 0)
             (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
@@ -883,7 +958,7 @@ out))
 
 (defun quantum-cond-phase-inv (control target reg)
 (let ((z #c(0.0 0.0)))
-  (setq z (quantum-cexp (/ (- *pi*) (ash 1 (- control target)))))
+  (setq z (quantum-cexp (/ (- pi) (ash 1 (- control target)))))
   (loop for i from 0 below (quantum-reg-size reg) do
         (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control)) 0)
             (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
@@ -903,7 +978,3 @@ out))
                 (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) z)))))
   (quantum-decohere reg)
 ))
-
-  
-
-
