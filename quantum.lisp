@@ -56,6 +56,32 @@
 (defconstant +BMEASURE_P+ #x82)
 (defconstant +NOP+ #xFF)
 ;;;
+
+(defstruct quantum-reg
+  (width 0 :type integer)
+  (size 0 :type integer)
+  (hashw 0 :type integer)
+  (amplitude (make-array 1 
+                         :element-type 'complex
+                         :adjustable 't
+                         :initial-element #c(0.0 0.0)))
+  (state (make-array 1 
+                     :element-type 'integer
+                     :adjustable 't
+                     :initial-element 0))
+  (hash (make-array 1
+                    :element-type 'integer
+                    :adjustable 't
+                    :initial-element 0)) )
+
+(defstruct quantum-matrix
+  (cols 0)
+  (rows 0)
+  (t1 (make-array 1 :element-type 'complex)))
+
+(defmacro M (m x y)
+  `(aref (quantum-matrix-t1 ,m) (+ ,x (* ,y (quantum-matrix-cols ,m)))))
+
 (defparameter opstatus 0)
 ;;; Type of QEC. Currently implemented versions are:
 ;;; 0 : no QEC (default)
@@ -91,9 +117,189 @@
   (setq qec-width swidth)
 )
 
+(defun quantum-qec-get-status (ptype &optional pwidth)
+  "Get the current QEC status"
+  (setq ptype qec-type)
+  (setq pwidth qec-width))
+
+(defun quantum-qec-encode (type width reg)
+  (let ((lambda 0.0))
+    (setq lambda (quantum-get-decoherence))
+    (quantum-set-decoherence 0)
+    (loop for i from 0 below width do
+      (if (= i (1- (quantum-reg-width reg)))
+          (quantum-set-decoherence lambda))
+      (if (< i width)
+          (progn
+            (quantum-hadamard (+ (quantum-reg-width reg) i) reg)
+            (quantum-hadamard (+ (* 2 (quantum-reg-width reg)) i) reg)
+            (quantum-cnot (+ (quantum-reg-width reg) i) i reg)
+            (quantum-cnot (+ (* 2 (quantum-reg-width reg)) i) i reg))
+          (progn
+            (quantum-cnot i (+ (quantum-reg-width reg) i) reg)
+            (quantum-cnot i (+ (* 2 (quantum-reg-width reg)) i) reg))))
+    (quantum-qec-set-status 1 (quantum-reg-width reg))
+    (setf (quantum-reg-width reg) (* (quantum-reg-width reg) 3))
+    )
+  )
+
+(defun quantum-qec-decode (type width reg)
+  "Decode a quantum register and perform Quantum Error Correction on it"
+  (let ((swidth 0)
+        (lambda 0.0)
+        (a 0)
+        (b 0))
+    (setq lambda (quantum-get-decoherence))
+    (quantum-set-decoherence 0)
+    (setq swidth (/ (quantum-reg-width reg) 3))
+    (quantum-qec-set-status 0 0)
+    (loop for i downfrom (/ (quantum-reg-width reg) 3) to 0 do
+      (if (= i 0)
+          (quantum-set-decoherence lambda))
+      (if (< i width)
+          (progn
+            (quantum-cnot (+ (* 2 swidth) i) i reg)
+            (quantum-cnot (+ i swidth) i reg)
+            (quantum-hadamard (+ (* 2 swidth) i) reg)
+            (quantum-hadamard (+ i swidth) reg))
+          (progn
+            (quantum-cnot i (+ (* 2 swidth) i) reg)
+            (quantum-cnot i (+ i swidth) reg))))
+    (loop for i from 1 to swidth do
+      (setq a (quantum-bmeasure swidth reg))
+      (setq b (quantum-bmeasure (- (* 2 swidth) i) reg))
+      (if (and (and (= a 1) (= b 1)) (< (1- i) width))
+          (quantum-sigma-z (1- i) reg)))
+    )
+  )
+
+(defun quantum-sigma-x-ft (target reg)
+  "Fault-tolerant version of NOT gate"
+  (let ((tmp 0)
+        (lambda 0.0))
+    (setq tmp qec-type)
+    (setq qec-type 0)
+    (setq lambda (quantum-get-decoherence))
+    (quantum-set-decoherence 0)
+    (quantum-sigma-x target reg)
+    (quantum-sigma-x (+ target qec-width) reg)
+    (quantum-set-decoherence lambda)
+    (quantum-qec-counter 1 0 reg)
+    (setq qec-type tmp)
+    )
+  )
+
+(defun quantum-cnot-ft (control target reg)
+  "Fault-tolerant version of Controlled NOT gate"
+  (let ((tmp 0)
+        (lambda 0.0))
+    (setq tmp qec-type)
+    (setq qec-type 0)
+    (setq lambda (quantum-get-decoherence))
+    (quantum-set-decoherence 0)
+    (quantum-cnot control target reg)
+    (quantum-cnot (+ control qec-width) (+ target qec-width) reg)
+    (quantum-set-decoherence lambda)
+    (quantum-cnot (+ control (* 2 qec-width)) (+ target (* 2 qec-width)) reg)
+    (quantum-qec-counter  1 0 reg)
+    (setq qec-type tmp)
+    )
+  )
+
+(defun quantum-toffoli-ft (control1 control2 target reg)
+  "Fault-tolerant version of the Toffoli gate"
+  (let ((c1 0)
+        (c2 0)
+        (mask 0))
+    (setq mask (+ (ash 1 target) (ash 1 (+ target qec-width)) (ash 1 (+ target (* 2 qec-width)))))
+    (loop for i from 0 below (quantum-reg-size reg) do
+      (setq c1 0)
+      (setq c2 0)
+      (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control1)) 0)
+          (setq c1 1))
+      (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 (+ qec-width control1))) 0)
+          (setq c1 (logxor c1 1)))
+      (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 (+ control1 (* 2 qec-width)))) 0)
+          (setq c1 (logxor c1 1)))
+      (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control2)) 0)
+          (setq c2 1))
+      (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 (+ control2 qec-width))) 0)
+          (setq c2 (logxor c2 1)))
+      (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 (+ control2 (* 2 qec-width)))) 0)
+          (setq c2 (logxor c2 1)))
+      (if (and (= c1 1) (= c2 1))
+          (setf (aref (quantum-reg-state reg) i) (logxor (aref (quantum-reg-state reg) i) mask))))
+    (quantum-decohere reg)
+    (quantum-qec-counter 1 0 reg)
+    )
+  )
+
+(defun quantum-qec-counter (inc frequency reg)
+  "Counter which can be used to apply QEC periodically"
+  (let ((counter 0)
+        (freq (ash 1 30)))
+    (if (> inc 0)
+        (incf counter inc)
+        (if (< inc 0)
+            (setq counter 0)))
+    (if (> frequency 0)
+        (setq freq frequency))
+    (if (>= counter freq)
+        (progn
+          (setq counter 0)
+          (quantum-qec-decode qec-type qec-width reg)
+          (quantum-qec-encode qec-type qec-width reg)))
+    counter)
+  )
+
 ;;; end of QEC section
 
+;;; MEASURE
+
+(defun quantum-measure (reg)
+  "Measure the contents of a quantum register"
+  (let ((r 0.0))
+    (if (quantum-objcode-put +MEASURE+)
+        (return-from quantum-measure 0))
+    (setq r (random 1.0))
+    (loop for i from 0 below (quantum-reg-size reg) do
+      (decf r (quantum-prob-inline (aref (quantum-reg-amplitude reg) i)))
+      (if (>= 0 r)
+          (return-from quantum-measure (aref (quantum-reg-state reg) i))))
+    (return-from quantum-measure (- 1))
+    )
+  )
+
+(defun quantum-bmeasure (pos reg)
+  "Measure a single bit of a quantum register. The bit measured is
+   indicated by its position POS, starting with 0 as the least
+   significant bit. The new state of the quantum register depends on
+   the result of the measurement."
+  (let ((result 0)
+        (pa 0.0)
+        (r 0.0)
+        (pos2 0)
+        (out reg))
+    (if (quantum-objcode-put +BMEASURE+ pos)
+        (return-from quantum-bmeasure 0))
+    (setq pos2 (ash 1 pos))
+    (loop for i from 0 below (quantum-reg-size reg) do
+      (if (= (logand (aref (quantum-reg-state reg) i) pos2) 0)
+          (incf pa (quantum-prob-inline (aref (quantum-reg-amplitude reg) i)))))
+    (setq r (random 1.0))
+    (if (> r pa)
+        (setq result 1))
+    (setq out (quantum-state-collapse pos result reg))
+    (quantum-delete-qureg-hashpreserve reg)
+    (setq reg out)
+    result
+    )
+  )
+
+;;; end of MEASURE
+
 ;;; Decoherence
+          
 (defun quantum-get-decoherence ()
   decoherence-quantum-status)
 
@@ -135,7 +341,9 @@
         )
     )
   )
+          
 ;;; end of decoherence
+          
 (defun quantum-n2char (mu buf)
 "Convert a big integer to a byte array"
 (let ((size +MAX-UNSIGNED+))
@@ -247,30 +455,7 @@
     (bit-vector->integer b32)
     ))
 
-(defstruct quantum-reg
-  (width 0 :type integer)
-  (size 0 :type integer)
-  (hashw 0 :type integer)
-  (amplitude (make-array * 
-                         :element-type 'complex
-                         :adjustable 't
-                         :initial-element #c(0.0 0.0)))
-  (state (make-array * 
-                     :element-type 'integer
-                     :adjustable 't
-                     :initial-element 0))
-  (hash (make-array *
-                    :element-type 'integer
-                    :adjustable 't
-                    :initial-element 0)) )
 
-(defstruct quantum-matrix
-  (cols 0)
-  (rows 0)
-  (t1 (make-array * :element-type 'complex)))
-
-(defmacro M (m x y)
-  `(aref (quantum-matrix-t1 ,m) (+ ,x (* ,y (quantum-matrix-cols ,m)))))
 
 (defun quantum-frac-approx (a b width)
   "Fractional approximation of a decimal value"
@@ -566,47 +751,47 @@ Allocate memory for 1 base state"
   reg))
 
 (defun quantum-state-collapse (pos value reg)
-"Reduce the state vector after measurement or partial trace"
-(let* ((l-siz 0)
-       (d 0.0)
-       (lpat 0)
-       (rpat 0)
-       (j 0)
-       (out (make-quantum-reg))
-       (pos2 (ash 1 pos)))
-  (loop for i from 0 below (quantum-reg-size reg) do
-        (if (or (and (logand (aref (quantum-reg-state reg) i) pos2) (if (= value 0) 'nil 't))
-                (and (lognand (aref (quantum-reg-state reg) i) pos2)
-                     (if (= value 0) 't 'nil)))
-            (progn
-              (setq d (+ d (quantum-prob-inline (aref (quantum-reg-amplitude reg) i))))
-              (setq l-siz (1+ l-siz)))))
-  (setf out (make-quantum-reg
-             :size l-siz
-             :width (- (quantum-reg-width reg) 1)
-             :hashw (quantum-reg-hashw reg)
-             :hash (quantum-reg-hash reg)
-             :state (make-array l-siz :element-type 'integer :adjustable 't)
-             :amplitude (make-array l-siz 
-                                    :element-type 'complex
-                                    :adjustable 't
-                                    :initial-element #c(0.0 0.0))))
-  (setq j 0)
-  (loop for i from 0 below (quantum-reg-size reg) do
-        (if (or (and (logand (aref (quantum-reg-state reg) i) pos2)
-                     (if (= value 0) 'nil 't))
-                (and (lognand (aref (quantum-reg-state reg) i) pos2)
-                     (if (= value 0) 't 'nil)))
-            (progn
-              (setq rpat (loop for k from 0 below pos sum (+ rpat (ash 1 k))))
-              (setq rpat (logand rpat (aref (quantum-reg-state reg) i)))
-              (setq lpat (loop for k downfrom (1- (* 8 +MAX-UNSIGNED+)) to (1- pos) sum (+ lpat (ash 1 k))))
-              (setq lpat (logand lpat (aref (quantum-reg-state reg) i)))
-              (setf (aref (quantum-reg-state out) j) (logior (ash lpat -1) rpat))
-              (setf (aref (quantum-reg-amplitude out) j) (* (aref (quantum-reg-amplitude reg) i)
-                                                            (/ 1 (sqrt d))))
-              (setq j (1+ j)))))
-out))
+  "Reduce the state vector after measurement or partial trace"
+  (let* ((l-siz 0)
+         (d 0.0)
+         (lpat 0)
+         (rpat 0)
+         (j 0)
+         (out (make-quantum-reg))
+         (pos2 (ash 1 pos)))
+    (loop for i from 0 below (quantum-reg-size reg) do
+      (if (or (and (logand (aref (quantum-reg-state reg) i) pos2) (if (= value 0) 'nil 't))
+              (and (lognand (aref (quantum-reg-state reg) i) pos2)
+                   (if (= value 0) 't 'nil)))
+          (progn
+            (setq d (+ d (quantum-prob-inline (aref (quantum-reg-amplitude reg) i))))
+            (setq l-siz (1+ l-siz)))))
+    (setf out (make-quantum-reg
+               :size l-siz
+               :width (- (quantum-reg-width reg) 1)
+               :hashw (quantum-reg-hashw reg)
+               :hash (quantum-reg-hash reg)
+               :state (make-array l-siz :element-type 'integer :adjustable 't)
+               :amplitude (make-array l-siz 
+                                      :element-type 'complex
+                                      :adjustable 't
+                                      :initial-element #c(0.0 0.0))))
+    (setq j 0)
+    (loop for i from 0 below (quantum-reg-size reg) do
+      (if (or (and (logand (aref (quantum-reg-state reg) i) pos2)
+                   (if (= value 0) 'nil 't))
+              (and (lognand (aref (quantum-reg-state reg) i) pos2)
+                   (if (= value 0) 't 'nil)))
+          (progn
+            (setq rpat (loop for k from 0 below pos sum (+ rpat (ash 1 k))))
+            (setq rpat (logand rpat (aref (quantum-reg-state reg) i)))
+            (setq lpat (loop for k downfrom (1- (* 8 +MAX-UNSIGNED+)) to (1- pos) sum (+ lpat (ash 1 k))))
+            (setq lpat (logand lpat (aref (quantum-reg-state reg) i)))
+            (setf (aref (quantum-reg-state out) j) (logior (ash lpat -1) rpat))
+            (setf (aref (quantum-reg-amplitude out) j) (* (aref (quantum-reg-amplitude reg) i)
+                                                          (/ 1 (sqrt d))))
+            (setq j (1+ j)))))
+    out))
 
 (defun quantum-hash64 (key width)
 "Our 64-bit multiplicative hash function"
@@ -615,6 +800,39 @@ out))
   (setq k32 (ul-mult k32 #x9e370001))
   (setq k32 (ash k32 (- width 32)))
   k32))
+
+(defun quantum-destroy-hash (reg)
+  "Destroy the entire hash table of a quantum register"
+  (setf (quantum-reg-hash reg) (make-array 1
+                                           :element-type 'integer
+                                           :adjustable 't
+                                           :initial-element 0)))
+
+(defun quantum-delete-qureg (reg)
+  "Delete a quantum register"
+  (if (/= (quantum-reg-hashw reg) 0)
+      (quantum-destroy-hash reg))
+  (setf (quantum-reg-amplitude reg) (make-array 1
+                                                :element-type 'complex
+                                                :adjustable 't
+                                                :initial-element #c(0.0 0.0)))
+  (setf (quantum-reg-state reg) (make-array 1
+                                            :element-type 'integer
+                                            :adjustable 't
+                                            :initial-element 0))
+  )
+
+(defun quantum-delete-qureg-hashpreserve (reg)
+  "Delete a quantum register but leave the hash table alive"
+  (setf (quantum-reg-amplitude reg) (make-array 1
+                                                :element-type 'complex
+                                                :adjustable 't
+                                                :initial-element #c(0.0 0.0)))
+  (setf (quantum-reg-state reg) (make-array 1
+                                            :element-type 'integer
+                                            :adjustable 't
+                                            :initial-element 0))
+  )
 
 (defun quantum-bitmask (a width bits)
 "Return the reduced bitmask of a basis state"
@@ -640,24 +858,26 @@ out))
     (return-from hashing-0 -1))))
 
 (defun quantum-dot-product (reg1 reg2)
-"Compute the dot product of two quantum registers"
-(let ((f #c(0.0 0.0))
-      (j 0))
-  (if (/= (quantum-reg-hashw reg2) 0)
-      (quantum-reconstruct-hash reg2))
-
-  (if (/= (aref (quantum-reg-state reg1) 0))
-      (loop for i from 0 below (quantum-reg-size reg1) do
+  "Compute the dot product of two quantum registers"
+  (let ((f #c(0.0 0.0))
+        (j 0))
+    (if (/= (quantum-reg-hashw reg2) 0)
+        (quantum-reconstruct-hash reg2))
+    
+    (if (/= (aref (quantum-reg-state reg1) 0))
+        (loop for i from 0 below (quantum-reg-size reg1) do
+          (progn
             (setq j (quantum-get-state (aref (quantum-reg-state reg1) i) reg2))
-            (if (> j -1)
+            (if (> j (- 1))
                 (setf f (+ f (conjugate (* (aref (quantum-reg-amplitude reg1) i)
-                                           (aref (quantum-reg-amplitude reg2) i)))))))
-    (loop for i from 0 below (quantum-reg-size reg1) do
-          (setq j (quantum-get-state i reg2))
-          (if (> j -1)
-              (setf f (+ f (conjugate (* (aref (quantum-reg-amplitude reg1) i)
-                                         (aref (quantum-reg-amplitude reg2) i))))))))
-  f))
+                                           (aref (quantum-reg-amplitude reg2) i))))))))
+        (loop for i from 0 below (quantum-reg-size reg1) do
+          (progn
+            (setq j (quantum-get-state i reg2))
+            (if (> j (- 1))
+                (setf f (+ f (conjugate (* (aref (quantum-reg-amplitude reg1) i)
+                                           (aref (quantum-reg-amplitude reg2) i)))))))))
+    f))
 
 (defun quantum-dot-product-noconj (reg1 reg2)
 "Compute the dot product of two quantum registers without complex conjugation."
@@ -670,7 +890,7 @@ out))
                                                                       (aref (quantum-reg-amplitude reg2) (aref (quantum-reg-state reg1) i)))))
     (loop for i from 0 below (quantum-reg-size reg1) do
           (setq j (quantum-get-state (aref (quantum-reg-state reg1) i) reg2))
-          (if (> j -1)
+          (if (> j (- 1))
               (setq f (* (aref (quantum-reg-amplitude reg1) i) (aref (quantum-reg-amplitude reg2) j))))))
   f))
 
@@ -703,7 +923,7 @@ out))
       (progn
         (quantum-reconstruct-hash reg)
         (loop for i from 0 below (quantum-reg-size reg) do
-              (if (= (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target)) reg) -1)
+              (if (= (quantum-get-state (logxor (aref (quantum-reg-state reg) i) (ash 1 target)) reg) (- 1))
                   (setf addsize (1+ addsize))))
         (setf (quantum-reg-state reg) (adjust-array (quantum-reg-state reg) (+ (quantum-reg-size reg) addsize)))
         (setf (quantum-reg-amplitude reg) (adjust-array (quantum-reg-amplitude reg) (+ (quantum-reg-size reg) addsize)))
@@ -866,6 +1086,112 @@ out))
       (setq global-gate-counter 0))
   global-gate-counter)
 
+(defun quantum-cnot (control target reg)
+  "Apply a controlled-not gate"
+  (let ((qec 0))
+    (quantum-qec-get-status qec)
+    (if (/= qec 0)
+        (quantum-cnot-ft control target reg)
+        (progn
+          (if (quantum-objcode-put +CNOT+ control target)
+              (return-from quantum-cnot))
+          (loop for i from 0 below (quantum-reg-size reg) do
+            (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control)) 0)
+                (setf (aref (quantum-reg-state reg) i) (logxor (aref (quantum-reg-state reg) i) (ash 1 target)))))
+          (quantum-decohere reg)))
+    )
+  )
+
+(defun quantum-toffoli (control1 control2 target reg)
+  "Apply a toffoli (controlled-controlled-cnot) gate"
+  (let ((qec 0))
+    (quantum-qec-get-status qec)
+    (if (/= qec 0)
+        (quantum-toffoli-ft control1 control2 target reg)
+        (progn
+          (if (quantum-objcode-put +TOFFOLI+ control1 control2 target)
+              (return-from quantum-toffoli))
+          (loop for i from 0 below (quantum-reg-size reg) do
+            (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control1)) 0)
+                (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 control2)) 0)
+                    (setf (aref (quantum-reg-state reg) i) (logxor (aref (quantum-reg-state reg) i) (ash 1 target))))))
+          (quantum-decohere reg)))
+    )
+  )
+
+(defun quantum-sigma-x (target reg)
+  "Apply a sigma-x (or not) gate"
+  (let ((qec 0))
+    (quantum-qec-get-status qec)
+    (if (/= qec 0)
+        (quantum-sigma-x-ft target reg)
+        (progn
+          (if (quantum-objcode-put +SIGMA-X+ target)
+              (return-from quantum-sigma-x))
+          (loop for i from 0 below (quantum-reg-size reg) do
+            (setf (aref (quantum-reg-state reg) i) (logxor (aref (quantum-reg-state reg) i) (ash 1 target))))
+          (quantum-decohere reg)))
+    )
+  )
+
+(defun quantum-sigma-y (target reg)
+  "Apply a sigma-y gate"
+  (if (quantum-objcode-put +SIGMA-Y+ target)
+      (return-from quantum-sigma-y))
+  (loop for i from 0 below (quantum-reg-size reg) do
+    (setf (aref (quantum-reg-state reg) i) (logxor (aref (quantum-reg-state reg) i) (ash 1 target)))
+    (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
+        (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) #c(0.0 1.0)))
+        (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) (- #c(0.0 1.0))))))
+  (quantum-decohere reg)
+  )
+
+(defun quantum-sigma-z (target reg)
+  "Apply a sigma-z gate"
+  (if (quantum-objcode-put +SIGMA-Z+ target)
+      (return-from quantum-sigma-z))
+  (loop for i from 0 below (quantum-reg-size reg) do
+    (if (/= (logand (aref (quantum-reg-state reg) i) (ash 1 target)) 0)
+        (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) (- 1)))))
+  (quantum-decohere reg)
+  )
+
+(defun quantum-swaptheleads (width reg)
+  "Swap the first WIDTH bits of the quantum register. This is done
+   classically by renaming the bits, unless QEC is enabled."
+  (let ((qec 0)
+        (pat1 0)
+        (pat2 0)
+        (l 0))
+    (quantum-qec-get-status qec)
+    (if (/= qec 0)
+        (loop for i from 0 below width do
+          (quantum-cnot i (+ width i) reg)
+          (quantum-cnot (+ width i) i reg)
+          (quantum-cnot i (+ width i) reg))
+        (loop for i from 0 below (quantum-reg-size reg) do
+          (if (quantum-objcode-put +SWAPLEADS+ width)
+              (return-from quantum-swaptheleads))
+          (setq pat1 (rem (aref (quantum-reg-state reg) i) (ash 1 width)))
+          (setq pat2 0)
+          (loop for j from 0 below width do
+            (incf pat2 (logand (aref (quantum-reg-state reg) i) (ash 1 (+ width j)))))
+          (setq l (- (aref (quantum-reg-state reg) i) (+ pat1 pat2)))
+          (incf l (ash pat1 width))
+          (incf l (ash pat2 (- width)))
+          (setf (aref (quantum-reg-state reg) i) l)))
+    )
+  )
+
+(defun quantum-swaptheleads-omuln-controlled (control width reg)
+  "Swap WIDTH bits starting at WIDTH and 2*WIDTH+2 controlled by
+   CONTROL"
+  (loop for i from 0 below width do
+    (quantum-toffoli control (+ width i) (+ (* 2 width) i 2) reg)
+    (quantum-toffoli control (+ (* 2 width) i 2) (+ i width) reg)
+    (quantum-toffoli control (+ i width) (+ (* 2 width) i 2) reg))
+  )
+
 (defun quantum-hadamard (target reg)
   "Apply a hadamard gate"
   (let ((m (quantum-new-matrix 2 2)))
@@ -978,3 +1304,23 @@ out))
                 (setf (aref (quantum-reg-amplitude reg) i) (* (aref (quantum-reg-amplitude reg) i) z)))))
   (quantum-decohere reg)
 ))
+
+;;; end of quantum gates
+
+(defun quantum-qft (width reg)
+  "Perform a QFT on a quantum register. This is done by application of
+   conditional phase shifts and hadamard gates. At the end, the
+   position of the bits is reversed."
+  (loop for i downfrom (1- width) to 0 do
+    (loop for j downfrom (1- width) to (1+ i) do
+      (quantum-cond-phase j i reg))
+    (quantum-hadamard i reg))
+  )
+
+(defun quantum-qft-inv (width reg)
+  "Perform an inverse QFT"
+  (loop for i from 0 below width do
+    (quantum-hadamard i reg)
+    (loop for j from (1+ i) below width do
+      (quantum-cond-phase j i reg)))
+  )

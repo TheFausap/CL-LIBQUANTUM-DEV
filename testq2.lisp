@@ -1,0 +1,7 @@
+(setq r1 (quantum-new-qureg 3 2))
+(quantum-addscratch 1 r1)
+(quantum-print-qureg r1)
+(quantum-toffoli 1 2 3 r1)
+(quantum-print-qureg r1)
+(quantum-cnot 1 2 r1)
+(quantum-print-qureg r1)
